@@ -50,23 +50,6 @@ def to_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def market_range_for_date(date_str: str):
-    d = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=IST)
-    start = d.replace(hour=9, minute=0, second=0, microsecond=0)
-    end = d.replace(hour=15, minute=30, second=0, microsecond=0)
-    return to_ms(start), to_ms(end)
-
-
-def candle_time_range(candles):
-    if not candles:
-        return None, None
-
-    return (
-        datetime.fromtimestamp(candles[0][0], IST).strftime("%H:%M:%S"),
-        datetime.fromtimestamp(candles[-1][0], IST).strftime("%H:%M:%S"),
-    )
-
-
 def parse_entry_after():
     val = request.args.get("entry_after")
     if not val:
@@ -76,6 +59,27 @@ def parse_entry_after():
         return dtime(h, m)
     except Exception:
         return DEFAULT_ENTRY_AFTER
+
+
+def parse_end_before():
+    val = request.args.get("end_before")
+    if not val:
+        return None
+    try:
+        h, m = map(int, val.split(":"))
+        return dtime(h, m)
+    except Exception:
+        return None
+
+
+def parse_trade_date(default_today=True):
+    val = request.args.get("date")
+    if not val:
+        return datetime.now(IST).date() if default_today else None
+    try:
+        return datetime.strptime(val, "%Y-%m-%d").date()
+    except Exception:
+        return datetime.now(IST).date() if default_today else None
 
 
 def normalize_ts(ts: int) -> int:
@@ -123,7 +127,7 @@ async def fetch_signals(session):
 # =====================================================
 # TRADE ANALYSIS
 # =====================================================
-def analyze_trade(candles, signal, entry_after_time: dtime):
+def analyze_trade(candles, signal, entry_after_time, end_before_time):
     entry = signal["entry"]
     target = signal["target"]
     stoploss = signal["stoploss"]
@@ -131,24 +135,18 @@ def analyze_trade(candles, signal, entry_after_time: dtime):
 
     entered = False
     entry_time = None
-
     last_close = None
-    last_dt = None
 
     for ts, o, h, l, c, v in candles:
         ts = normalize_ts(ts)
         candle_dt = datetime.fromtimestamp(ts, UTC).astimezone(IST)
         t = candle_dt.strftime("%H:%M:%S")
-
         last_close = c
-        last_dt = candle_dt
 
-        # ENTRY
-        if (
-            not entered
-            and candle_dt.time() >= entry_after_time
-            and h >= entry
-        ):
+        if end_before_time and candle_dt.time() > end_before_time:
+            break
+
+        if not entered and candle_dt.time() >= entry_after_time and h >= entry:
             entered = True
             entry_time = t
 
@@ -173,7 +171,6 @@ def analyze_trade(candles, signal, entry_after_time: dtime):
                     "market_closed": False,
                 }
 
-    # ✅ AUTO EXIT AT MARKET CLOSE
     if entered and last_close is not None:
         return {
             "status": "EXITED_MARKET_CLOSE",
@@ -196,29 +193,23 @@ def analyze_trade(candles, signal, entry_after_time: dtime):
 # =====================================================
 # ROUTES
 # =====================================================
-@app.route("/")
-def home():
-    return jsonify({
-        "status": "ok",
-        "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
-    })
-
-
-@app.route("/api/symbols")
-def get_symbols():
-    with open(COMPANY_FILE) as f:
-        companies = json.load(f)
-
-    symbols = sorted({c.split("__")[0].strip() for c in companies if "__" in c})
-    return jsonify({"status": "ok", "count": len(symbols), "symbols": symbols})
-
 
 @app.route("/api/live-candles")
 def live_candles():
     latest = request.args.get("latest", "false").lower() == "true"
+    trade_date = parse_trade_date(default_today=True)
 
-    now = datetime.now(IST)
-    start_ms, end_ms = market_range_for_date(now.strftime("%Y-%m-%d"))
+    market_open = datetime.combine(trade_date, dtime(9, 0), tzinfo=IST)
+    market_close = datetime.combine(trade_date, MARKET_CLOSE, tzinfo=IST)
+
+    end_dt = (
+        datetime.now(IST)
+        if trade_date == datetime.now(IST).date()
+        else market_close
+    )
+
+    start_ms = to_ms(market_open)
+    end_ms = to_ms(end_dt)
 
     with open(COMPANY_FILE) as f:
         companies = json.load(f)
@@ -240,19 +231,17 @@ def live_candles():
 
     data = asyncio.run(runner())
 
-    results = {}
     candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
-
-    for sym, candles in data:
-        results[sym] = candles[-candles_needed:] if latest else candles
-
-    st, et = candle_time_range([c for v in results.values() for c in v])
+    results = {
+        sym: c[-candles_needed:] if latest else c
+        for sym, c in data
+    }
 
     return jsonify({
-        "mode": "latest" if latest else "full",
+        "status": "ok",
+        "date": trade_date.strftime("%Y-%m-%d"),
+        "latest": latest,
         "count": len(results),
-        "start_time": st,
-        "end_time": et,
         "data": results,
     })
 
@@ -264,6 +253,8 @@ def analyze_signals():
     breakout_pct = float(request.args.get("breakout", 3))
     profit_pct = float(request.args.get("profit", 3))
     entry_after_time = parse_entry_after()
+    end_before_time = parse_end_before()
+    trade_date = parse_trade_date(default_today=False)
 
     async def runner():
         async with aiohttp.ClientSession(
@@ -272,16 +263,18 @@ def analyze_signals():
             signals = await fetch_signals(session)
             signal_map = {s["symbol"]: s for s in signals}
 
-            now = datetime.now(IST)
-            market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-            if now < market_open:
-                market_open -= timedelta(days=1)
-
-            start_ms = to_ms(market_open)
-            end_ms = to_ms(now)
+            if trade_date:
+                market_open = datetime.combine(trade_date, MARKET_OPEN, tzinfo=IST)
+                market_close = datetime.combine(trade_date, MARKET_CLOSE, tzinfo=IST)
+                now = market_close if trade_date != datetime.now(IST).date() else datetime.now(IST)
+            else:
+                now = datetime.now(IST)
+                market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+                if now < market_open:
+                    market_open -= timedelta(days=1)
 
             candles = await asyncio.gather(*[
-                fetch_groww_candles(session, s, start_ms, end_ms)
+                fetch_groww_candles(session, s, to_ms(market_open), to_ms(now))
                 for s in signal_map
             ])
 
@@ -297,45 +290,63 @@ def analyze_signals():
         "not_entered": 0,
     }
 
-    results = {}
+    raw_results = {
+        "entered": {},
+        "exited": {
+            "profit": {},
+            "stoploss": {},
+        },
+        "not_entered": {},
+    }
 
     for sym, candles in candle_results:
         sig = signal_map[sym]
 
-        open_price = sig["open"]
-        entry = round(open_price * (1 + breakout_pct / 100), 2)
+        entry = round(sig["open"] * (1 + breakout_pct / 100), 2)
         target = round(entry * (1 + profit_pct / 100), 2)
-
         sig = {**sig, "entry": entry, "target": target}
 
-        analysis = analyze_trade(candles, sig, entry_after_time)
-        status = analysis["status"]
+        analysis = analyze_trade(candles, sig, entry_after_time, end_before_time)
+        payload = {**sig, **analysis}
 
-        if status == "EXITED_TARGET":
+        if analysis["status"] == "EXITED_TARGET":
             summary["entered"] += 1
             summary["target_hit"] += 1
-        elif status == "EXITED_SL":
+            raw_results["exited"]["profit"][sym] = payload
+
+        elif analysis["status"] == "EXITED_SL":
             summary["entered"] += 1
             summary["stoploss_hit"] += 1
-        elif status == "EXITED_MARKET_CLOSE":
+            raw_results["exited"]["stoploss"][sym] = payload
+
+        elif analysis["status"] == "EXITED_MARKET_CLOSE":
             summary["entered"] += 1
             summary["market_closed"] += 1
-        elif status == "ENTERED":
-            summary["entered"] += 1
+            raw_results["entered"][sym] = payload
+
         else:
             summary["not_entered"] += 1
+            raw_results["not_entered"][sym] = payload
 
-        results[sym] = {**sig, **analysis}
+    ordered_results = {
+        "1_exited": {
+            "1_profit": raw_results["exited"]["profit"],
+            "2_stoploss": raw_results["exited"]["stoploss"],
+        },
+        "2_entered": raw_results["entered"],
+        "3_not_entered": raw_results["not_entered"],
+    }
 
     return jsonify({
         "status": "ok",
+        "date": trade_date.strftime("%Y-%m-%d") if trade_date else None,
         "breakout_pct": breakout_pct,
         "profit_pct": profit_pct,
         "entry_after": entry_after_time.strftime("%H:%M"),
-        "count": len(results),
+        "end_before": end_before_time.strftime("%H:%M") if end_before_time else None,
         "summary": summary,
         "response_time_ms": int((time.perf_counter() - start_clock) * 1000),
-        "the_data": results,
+        "the_data": ordered_results,
     })
 
 
@@ -343,4 +354,4 @@ def analyze_signals():
 # RUN
 # =====================================================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=5000, debug=True)

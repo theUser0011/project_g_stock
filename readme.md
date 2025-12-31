@@ -1,5 +1,9 @@
 # 📊 Groww Live Candle API (Flask)
 
+# http://localhost:5000/api/analyze-signals?date=2025-12-30&breakout=3&profit=1&entry_after=09:45&end_before=11:00
+
+
+
 # A lightweight Flask API to fetch **live & historical intraday candle data**
 from the **Groww Charting API** for NSE cash stocks.
 
