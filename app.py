@@ -27,7 +27,7 @@ LATEST_WINDOW_MINUTES = 5
 MAX_WORKERS = 100
 TIMEOUT = 20
 
-TOTAL_BATCHES = 10
+TOTAL_BATCHES = 2
 BATCH_NO = int(os.getenv("BATCH_NUM", 1))
 
 IST = timezone(timedelta(hours=5, minutes=30))
