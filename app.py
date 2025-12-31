@@ -189,10 +189,74 @@ def analyze_trade(candles, signal, entry_after_time, end_before_time):
         "pnl": None,
         "market_closed": False,
     }
+def load_company_map():
+    """
+    Returns:
+    {
+      "EMULTIMQ": {
+        "company": "EDELAMC - EMULTIMQ",
+        "url_path": "edelamc-emulti"
+      },
+      ...
+    }
+    """
+    with open(COMPANY_FILE) as f:
+        rows = json.load(f)
+
+    result = {}
+    for row in rows:
+        parts = row.split("__")
+        if len(parts) < 3:
+            continue
+
+        symbol = parts[0].strip()
+        company = parts[1].strip()
+        url_path = parts[2].strip()
+
+        result[symbol] = {
+            "company": company,
+            "url_path": url_path
+        }
+
+    return result
 
 # =====================================================
 # ROUTES
 # =====================================================
+@app.route("/api/company-info")
+def company_info():
+    """
+    Query params:
+      ?symbol=EMULTIMQ
+      ?symbol=EMULTIMQ,MSCIINDIA
+    """
+
+    symbol_param = request.args.get("symbol")
+    company_map = load_company_map()
+
+    # If no symbol requested → return all
+    if not symbol_param:
+        return jsonify({
+            "status": "ok",
+            "count": len(company_map),
+            "data": company_map
+        })
+
+    symbols = [s.strip() for s in symbol_param.split(",")]
+
+    filtered = {
+        s: company_map[s]
+        for s in symbols
+        if s in company_map
+    }
+
+    return jsonify({
+        "status": "ok",
+        "requested": symbols,
+        "count": len(filtered),
+        "data": filtered
+    })
+
 
 @app.route("/api/live-candles")
 def live_candles():
