@@ -2,7 +2,7 @@ import json
 import os
 import time
 import asyncio
-from datetime import datetime, timedelta, timezone, time as dtime
+from datetime import datetime, timedelta, timezone, time as dtime, UTC
 
 import aiohttp
 from flask import Flask, jsonify, request
@@ -31,10 +31,10 @@ TOTAL_BATCHES = 2
 BATCH_NO = int(os.getenv("BATCH_NUM", 1))
 
 IST = timezone(timedelta(hours=5, minutes=30))
-MARKET_OPEN = dtime(9, 0)
+MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 
-MAX_LOOKBACK_DAYS = 7
+DEFAULT_ENTRY_AFTER = dtime(9, 25)
 
 # =====================================================
 # FLASK
@@ -61,13 +61,25 @@ def candle_time_range(candles):
     if not candles:
         return None, None
 
-    start_ts = candles[0][0]
-    end_ts = candles[-1][0]
-
     return (
-        datetime.fromtimestamp(start_ts, IST).strftime("%H:%M:%S"),
-        datetime.fromtimestamp(end_ts, IST).strftime("%H:%M:%S"),
+        datetime.fromtimestamp(candles[0][0], IST).strftime("%H:%M:%S"),
+        datetime.fromtimestamp(candles[-1][0], IST).strftime("%H:%M:%S"),
     )
+
+
+def parse_entry_after():
+    val = request.args.get("entry_after")
+    if not val:
+        return DEFAULT_ENTRY_AFTER
+    try:
+        h, m = map(int, val.split(":"))
+        return dtime(h, m)
+    except Exception:
+        return DEFAULT_ENTRY_AFTER
+
+
+def normalize_ts(ts: int) -> int:
+    return ts // 1000 if ts > 1_000_000_000_000 else ts
 
 # =====================================================
 # ASYNC FETCH HELPERS
@@ -111,7 +123,7 @@ async def fetch_signals(session):
 # =====================================================
 # TRADE ANALYSIS
 # =====================================================
-def analyze_trade(candles, signal):
+def analyze_trade(candles, signal, entry_after_time: dtime):
     entry = signal["entry"]
     target = signal["target"]
     stoploss = signal["stoploss"]
@@ -120,41 +132,56 @@ def analyze_trade(candles, signal):
     entered = False
     entry_time = None
 
-    for ts, o, h, l, c, v in candles:
-        t = datetime.fromtimestamp(ts, IST).strftime("%H:%M:%S")
+    last_close = None
+    last_dt = None
 
-        if not entered and h >= entry:
+    for ts, o, h, l, c, v in candles:
+        ts = normalize_ts(ts)
+        candle_dt = datetime.fromtimestamp(ts, UTC).astimezone(IST)
+        t = candle_dt.strftime("%H:%M:%S")
+
+        last_close = c
+        last_dt = candle_dt
+
+        # ENTRY
+        if (
+            not entered
+            and candle_dt.time() >= entry_after_time
+            and h >= entry
+        ):
             entered = True
             entry_time = t
 
         if entered:
             if h >= target:
-                pnl = round((target - entry) * qty, 2)
                 return {
                     "status": "EXITED_TARGET",
                     "entry_time": entry_time,
                     "exit_time": t,
                     "exit_ltp": target,
-                    "pnl": pnl,
+                    "pnl": round((target - entry) * qty, 2),
+                    "market_closed": False,
                 }
 
             if l <= stoploss:
-                pnl = round((stoploss - entry) * qty, 2)
                 return {
                     "status": "EXITED_SL",
                     "entry_time": entry_time,
                     "exit_time": t,
                     "exit_ltp": stoploss,
-                    "pnl": pnl,
+                    "pnl": round((stoploss - entry) * qty, 2),
+                    "market_closed": False,
                 }
 
-    if entered:
+    # ✅ AUTO EXIT AT MARKET CLOSE
+    if entered and last_close is not None:
         return {
-            "status": "ENTERED",
+            "status": "EXITED_MARKET_CLOSE",
             "entry_time": entry_time,
-            "exit_time": None,
-            "exit_ltp": None,
-            "pnl": None,
+            "exit_time": MARKET_CLOSE.strftime("%H:%M:%S"),
+            "exit_ltp": last_close,
+            "pnl": round((last_close - entry) * qty, 2),
+            "market_closed": True,
         }
 
     return {
@@ -163,6 +190,7 @@ def analyze_trade(candles, signal):
         "exit_time": None,
         "exit_ltp": None,
         "pnl": None,
+        "market_closed": False,
     }
 
 # =====================================================
@@ -172,7 +200,6 @@ def analyze_trade(candles, signal):
 def home():
     return jsonify({
         "status": "ok",
-        "message": "Server running 🚀",
         "time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
     })
 
@@ -182,16 +209,8 @@ def get_symbols():
     with open(COMPANY_FILE) as f:
         companies = json.load(f)
 
-    symbols = sorted({
-        c.split("__")[0].strip()
-        for c in companies if "__" in c
-    })
-
-    return jsonify({
-        "status": "ok",
-        "count": len(symbols),
-        "symbols": symbols
-    })
+    symbols = sorted({c.split("__")[0].strip() for c in companies if "__" in c})
+    return jsonify({"status": "ok", "count": len(symbols), "symbols": symbols})
 
 
 @app.route("/api/live-candles")
@@ -199,49 +218,41 @@ def live_candles():
     latest = request.args.get("latest", "false").lower() == "true"
 
     now = datetime.now(IST)
-    trade_date = now.strftime("%Y-%m-%d")
-    start_ms, end_ms = market_range_for_date(trade_date)
+    start_ms, end_ms = market_range_for_date(now.strftime("%Y-%m-%d"))
 
     with open(COMPANY_FILE) as f:
         companies = json.load(f)
 
-    total = len(companies)
-    batch_size = max(1, total // TOTAL_BATCHES)
+    batch_size = max(1, len(companies) // TOTAL_BATCHES)
+    start = (BATCH_NO - 1) * batch_size
+    end = start + batch_size
 
-    batch_no = min(BATCH_NO, (total + batch_size - 1) // batch_size)
-    start = (batch_no - 1) * batch_size
-    end = min(start + batch_size, total)
-
-    batch = companies[start:end]
-    symbols = [c.split("__")[0].strip() for c in batch]
+    symbols = [c.split("__")[0].strip() for c in companies[start:end]]
 
     async def runner():
-        connector = aiohttp.TCPConnector(limit=MAX_WORKERS)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            tasks = [
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=MAX_WORKERS)
+        ) as session:
+            return await asyncio.gather(*[
                 fetch_groww_candles(session, s, start_ms, end_ms)
                 for s in symbols
-            ]
-            return await asyncio.gather(*tasks)
+            ])
 
-    candle_data = asyncio.run(runner())
+    data = asyncio.run(runner())
 
-    candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
     results = {}
+    candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
 
-    for sym, candles in candle_data:
+    for sym, candles in data:
         results[sym] = candles[-candles_needed:] if latest else candles
 
-    all_candles = [c for v in results.values() for c in v]
-    start_time, end_time = candle_time_range(all_candles)
+    st, et = candle_time_range([c for v in results.values() for c in v])
 
     return jsonify({
         "mode": "latest" if latest else "full",
-        "batch_no": batch_no,
-        "interval_minutes": INTERVAL_MINUTES,
         "count": len(results),
-        "start_time": start_time,
-        "end_time": end_time,
+        "start_time": st,
+        "end_time": et,
         "data": results,
     })
 
@@ -250,25 +261,31 @@ def live_candles():
 def analyze_signals():
     start_clock = time.perf_counter()
 
+    breakout_pct = float(request.args.get("breakout", 3))
+    profit_pct = float(request.args.get("profit", 3))
+    entry_after_time = parse_entry_after()
+
     async def runner():
-        connector = aiohttp.TCPConnector(limit=MAX_WORKERS)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=MAX_WORKERS)
+        ) as session:
             signals = await fetch_signals(session)
             signal_map = {s["symbol"]: s for s in signals}
 
-            symbols = list(signal_map.keys())
-
             now = datetime.now(IST)
-            start_ms = to_ms(now - timedelta(minutes=45))
+            market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+            if now < market_open:
+                market_open -= timedelta(days=1)
+
+            start_ms = to_ms(market_open)
             end_ms = to_ms(now)
 
-            tasks = [
+            candles = await asyncio.gather(*[
                 fetch_groww_candles(session, s, start_ms, end_ms)
-                for s in symbols
-            ]
+                for s in signal_map
+            ])
 
-            candle_results = await asyncio.gather(*tasks)
-            return signal_map, candle_results
+            return signal_map, candles
 
     signal_map, candle_results = asyncio.run(runner())
 
@@ -276,6 +293,7 @@ def analyze_signals():
         "entered": 0,
         "target_hit": 0,
         "stoploss_hit": 0,
+        "market_closed": 0,
         "not_entered": 0,
     }
 
@@ -283,7 +301,14 @@ def analyze_signals():
 
     for sym, candles in candle_results:
         sig = signal_map[sym]
-        analysis = analyze_trade(candles, sig)
+
+        open_price = sig["open"]
+        entry = round(open_price * (1 + breakout_pct / 100), 2)
+        target = round(entry * (1 + profit_pct / 100), 2)
+
+        sig = {**sig, "entry": entry, "target": target}
+
+        analysis = analyze_trade(candles, sig, entry_after_time)
         status = analysis["status"]
 
         if status == "EXITED_TARGET":
@@ -292,6 +317,9 @@ def analyze_signals():
         elif status == "EXITED_SL":
             summary["entered"] += 1
             summary["stoploss_hit"] += 1
+        elif status == "EXITED_MARKET_CLOSE":
+            summary["entered"] += 1
+            summary["market_closed"] += 1
         elif status == "ENTERED":
             summary["entered"] += 1
         else:
@@ -299,14 +327,15 @@ def analyze_signals():
 
         results[sym] = {**sig, **analysis}
 
-    elapsed = time.perf_counter() - start_clock
-
     return jsonify({
         "status": "ok",
+        "breakout_pct": breakout_pct,
+        "profit_pct": profit_pct,
+        "entry_after": entry_after_time.strftime("%H:%M"),
         "count": len(results),
         "summary": summary,
-        "response_time_ms": int(elapsed * 1000),
-        "data": results,
+        "response_time_ms": int((time.perf_counter() - start_clock) * 1000),
+        "the_data": results,
     })
 
 
