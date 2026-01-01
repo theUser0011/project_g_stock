@@ -191,31 +191,31 @@ def analyze_trade(candles, signal, entry_after_time, end_before_time):
     }
 def load_company_map():
     """
-    Returns:
-    {
-      "EMULTIMQ": {
-        "company": "EDELAMC - EMULTIMQ",
-        "url_path": "edelamc-emulti"
-      },
-      ...
-    }
+    Input format per row:
+    SYMBOL__Company Name__url_path__ISIN
     """
+
     with open(COMPANY_FILE) as f:
         rows = json.load(f)
 
     result = {}
+
     for row in rows:
         parts = row.split("__")
-        if len(parts) < 3:
+
+        # Expecting at least 4 parts now
+        if len(parts) < 4:
             continue
 
         symbol = parts[0].strip()
         company = parts[1].strip()
         url_path = parts[2].strip()
+        isin_symbol = parts[3].strip()
 
         result[symbol] = {
             "company": company,
-            "url_path": url_path
+            "url_path": url_path,
+            "isin_symbol": isin_symbol
         }
 
     return result
