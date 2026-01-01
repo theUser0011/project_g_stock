@@ -127,7 +127,7 @@ async def fetch_signals(session):
 # =====================================================
 # TRADE ANALYSIS
 # =====================================================
-def analyze_trade(candles, signal, entry_after_time, end_before_time):
+def analyze_trade(candles, signal, entry_after_time, end_before_time, market_closed):
     entry = signal["entry"]
     target = signal["target"]
     stoploss = signal["stoploss"]
@@ -181,6 +181,17 @@ def analyze_trade(candles, signal, entry_after_time, end_before_time):
             "market_closed": True,
         }
 
+    # ✅ ADDED — expire intraday signals that never entered
+    if not entered and market_closed:
+        return {
+            "status": "NOT_ENTERED_MARKET_CLOSE",
+            "entry_time": None,
+            "exit_time": MARKET_CLOSE.strftime("%H:%M:%S"),
+            "exit_ltp": None,
+            "pnl": 0,
+            "market_closed": True,
+        }
+
     return {
         "status": "NOT_ENTERED",
         "entry_time": None,
@@ -189,17 +200,11 @@ def analyze_trade(candles, signal, entry_after_time, end_before_time):
         "pnl": None,
         "market_closed": False,
     }
+
+# =====================================================
+# COMPANY MAP
+# =====================================================
 def load_company_map():
-    """
-    Returns:
-    {
-      "EMULTIMQ": {
-        "company": "EDELAMC - EMULTIMQ",
-        "url_path": "edelamc-emulti"
-      },
-      ...
-    }
-    """
     with open(COMPANY_FILE) as f:
         rows = json.load(f)
 
@@ -225,16 +230,9 @@ def load_company_map():
 # =====================================================
 @app.route("/api/company-info")
 def company_info():
-    """
-    Query params:
-      ?symbol=EMULTIMQ
-      ?symbol=EMULTIMQ,MSCIINDIA
-    """
-
     symbol_param = request.args.get("symbol")
     company_map = load_company_map()
 
-    # If no symbol requested → return all
     if not symbol_param:
         return jsonify({
             "status": "ok",
@@ -243,12 +241,7 @@ def company_info():
         })
 
     symbols = [s.strip() for s in symbol_param.split(",")]
-
-    filtered = {
-        s: company_map[s]
-        for s in symbols
-        if s in company_map
-    }
+    filtered = {s: company_map[s] for s in symbols if s in company_map}
 
     return jsonify({
         "status": "ok",
@@ -266,11 +259,7 @@ def live_candles():
     market_open = datetime.combine(trade_date, dtime(9, 0), tzinfo=IST)
     market_close = datetime.combine(trade_date, MARKET_CLOSE, tzinfo=IST)
 
-    end_dt = (
-        datetime.now(IST)
-        if trade_date == datetime.now(IST).date()
-        else market_close
-    )
+    end_dt = datetime.now(IST) if trade_date == datetime.now(IST).date() else market_close
 
     start_ms = to_ms(market_open)
     end_ms = to_ms(end_dt)
@@ -296,10 +285,7 @@ def live_candles():
     data = asyncio.run(runner())
 
     candles_needed = max(1, LATEST_WINDOW_MINUTES // INTERVAL_MINUTES)
-    results = {
-        sym: c[-candles_needed:] if latest else c
-        for sym, c in data
-    }
+    results = {sym: c[-candles_needed:] if latest else c for sym, c in data}
 
     return jsonify({
         "status": "ok",
@@ -342,9 +328,10 @@ def analyze_signals():
                 for s in signal_map
             ])
 
-            return signal_map, candles
+            return signal_map, candles, now
 
-    signal_map, candle_results = asyncio.run(runner())
+    signal_map, candle_results, now = asyncio.run(runner())
+    market_closed = now.time() >= MARKET_CLOSE
 
     summary = {
         "entered": 0,
@@ -356,10 +343,7 @@ def analyze_signals():
 
     raw_results = {
         "entered": {},
-        "exited": {
-            "profit": {},
-            "stoploss": {},
-        },
+        "exited": {"profit": {}, "stoploss": {}},
         "not_entered": {},
     }
 
@@ -370,7 +354,9 @@ def analyze_signals():
         target = round(entry * (1 + profit_pct / 100), 2)
         sig = {**sig, "entry": entry, "target": target}
 
-        analysis = analyze_trade(candles, sig, entry_after_time, end_before_time)
+        analysis = analyze_trade(
+            candles, sig, entry_after_time, end_before_time, market_closed
+        )
         payload = {**sig, **analysis}
 
         if analysis["status"] == "EXITED_TARGET":
@@ -392,15 +378,6 @@ def analyze_signals():
             summary["not_entered"] += 1
             raw_results["not_entered"][sym] = payload
 
-    ordered_results = {
-        "1_exited": {
-            "1_profit": raw_results["exited"]["profit"],
-            "2_stoploss": raw_results["exited"]["stoploss"],
-        },
-        "2_entered": raw_results["entered"],
-        "3_not_entered": raw_results["not_entered"],
-    }
-
     return jsonify({
         "status": "ok",
         "date": trade_date.strftime("%Y-%m-%d") if trade_date else None,
@@ -410,7 +387,11 @@ def analyze_signals():
         "end_before": end_before_time.strftime("%H:%M") if end_before_time else None,
         "summary": summary,
         "response_time_ms": int((time.perf_counter() - start_clock) * 1000),
-        "the_data": ordered_results,
+        "the_data": {
+            "1_exited": raw_results["exited"],
+            "2_entered": raw_results["entered"],
+            "3_not_entered": raw_results["not_entered"],
+        },
     })
 
 
