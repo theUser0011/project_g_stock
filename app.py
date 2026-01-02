@@ -234,7 +234,7 @@ def company_info():
     symbol_param = request.args.get("symbol")
     company_map = load_company_map()
 
-    # If no symbol requested → return all
+    # No symbol → return all
     if not symbol_param:
         return jsonify({
             "status": "ok",
@@ -242,7 +242,7 @@ def company_info():
             "data": company_map
         })
 
-    symbols = [s.strip() for s in symbol_param.split(",")]
+    symbols = [s.strip().upper() for s in symbol_param.split(",")]
 
     filtered = {
         s: company_map[s]
@@ -256,7 +256,6 @@ def company_info():
         "count": len(filtered),
         "data": filtered
     })
-
 
 @app.route("/api/live-candles")
 def live_candles():
