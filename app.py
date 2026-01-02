@@ -412,6 +412,13 @@ def analyze_signals():
         "response_time_ms": int((time.perf_counter() - start_clock) * 1000),
         "the_data": ordered_results,
     })
+    
+@app.route("/")
+def home():
+    return jsonify({
+        "status": "ok",
+        "message": "API is running"
+    })
 
  
 # =====================================================
